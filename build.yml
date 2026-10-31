@@ -1,0 +1,307 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Create project and build
+        run: |
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "AdSkipHelper"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_FILE'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.example.adskiphelper'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.example.adskiphelper'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 3
+                  versionName '3.0'
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="Ad Skip Helper"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AdSkipAccessibilityService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="false"
+                      android:label="Ad Skip Helper">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="200"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"/>
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#4CAF50</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/adskiphelper
+          cat > app/src/main/java/com/example/adskiphelper/MainActivity.java <<'EOF_FILE'
+          package com.example.adskiphelper;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              @Override public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(48, 64, 48, 48);
+
+                  TextView title = new TextView(this);
+                  title.setText("Ad Skip Helper");
+                  title.setTextSize(28);
+                  box.addView(title);
+
+                  TextView info = new TextView(this);
+                  info.setText("\nАвтоматически ищет доступные кнопки пропуска/закрытия рекламы.\n\nУмеет нажимать и значки ✕ / ▶| в углу рекламы (если рядом есть метка «Реклама»). Не нажимает «Скачать», «Забрать бонус», баннеры и ссылки.\n\nВключи сервис в Настройки → Специальные возможности.");
+                  info.setTextSize(16);
+                  box.addView(info);
+
+                  Button settings = new Button(this);
+                  settings.setText("Открыть специальные возможности");
+                  settings.setOnClickListener(v ->
+                      startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+                  box.addView(settings);
+
+                  setContentView(box);
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/adskiphelper
+          cat > app/src/main/java/com/example/adskiphelper/AdSkipAccessibilityService.java <<'EOF_FILE'
+          package com.example.adskiphelper;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.graphics.Path;
+          import android.graphics.Rect;
+          import android.os.SystemClock;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import java.util.Locale;
+
+          /**
+           * Ищет на экране кнопки «Пропустить» / «Закрыть» у рекламы и нажимает их.
+           *
+           * 1) Кнопка с подписью (текст / описание / id) — нажимаем.
+           *    Подпись про рекламу ("Пропустить рекламу", "Close ad") — нажимаем всегда,
+           *    общие ("Закрыть", "Skip", "×") — только если на экране есть метка «Реклама».
+           * 2) Кнопка без подписи (иконка ✕ или ▶| в правом верхнем углу): если на экране
+           *    есть метка «Реклама» и в углу ровно ОДНА маленькая иконка — нажимаем её.
+           * Кнопки «Скачать», «Установить», «Забрать бонус» и т.п. не нажимаются никогда.
+           */
+          public class AdSkipAccessibilityService extends AccessibilityService {
+              private long lastClick = 0L;
+
+              // состояние одного прохода по дереву
+              private boolean adMarker;
+              private AccessibilityNodeInfo labeled;
+              private int labeledLevel;
+              private AccessibilityNodeInfo corner;
+              private int cornerCount;
+              private int screenW, screenH, maxIcon;
+
+              @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+                  if (SystemClock.uptimeMillis() - lastClick < 1200) return;
+
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return;
+
+                  float density = getResources().getDisplayMetrics().density;
+                  screenW = getResources().getDisplayMetrics().widthPixels;
+                  screenH = getResources().getDisplayMetrics().heightPixels;
+                  maxIcon = (int) (80 * density);
+
+                  adMarker = false;
+                  labeled = null;
+                  labeledLevel = 0;
+                  corner = null;
+                  cornerCount = 0;
+
+                  scan(root, 0);
+
+                  AccessibilityNodeInfo target = null;
+                  if (labeled != null && (labeledLevel == 2 || adMarker)) {
+                      target = labeled;
+                  } else if (adMarker && corner != null && cornerCount == 1) {
+                      target = corner;
+                  }
+
+                  if (target != null && click(target, density)) {
+                      lastClick = SystemClock.uptimeMillis();
+                  }
+              }
+
+              private void scan(AccessibilityNodeInfo n, int depth) {
+                  if (n == null || depth > 40 || !n.isVisibleToUser()) return;
+
+                  String text = lower(n.getText());
+                  String desc = lower(n.getContentDescription());
+                  String id = lower(n.getViewIdResourceName());
+
+                  if (isAdMarker(text) || isAdMarker(desc)) adMarker = true;
+
+                  if (!isBlocked(text) && !isBlocked(desc)) {
+                      int level = Math.max(matchLevel(text), Math.max(matchLevel(desc), matchLevel(id)));
+                      if (level > labeledLevel) {
+                          labeled = n;
+                          labeledLevel = level;
+                      }
+
+                      // иконка без подписи в правом верхнем углу
+                      if ((n.getChildCount() == 0 || n.isClickable()) && text.length() <= 1) {
+                          Rect r = new Rect();
+                          n.getBoundsInScreen(r);
+                          if (r.width() > 0 && r.height() > 0
+                                  && r.width() <= maxIcon && r.height() <= maxIcon
+                                  && r.centerY() < screenH * 0.15f
+                                  && r.centerX() > screenW * 0.6f) {
+                              corner = n;
+                              cornerCount++;
+                          }
+                      }
+                  }
+
+                  for (int i = 0; i < n.getChildCount(); i++) {
+                      scan(n.getChild(i), depth + 1);
+                  }
+              }
+
+              /** 0 — не подходит, 1 — общая кнопка закрытия, 2 — явно про рекламу. */
+              private int matchLevel(String s) {
+                  if (s.isEmpty()) return 0;
+                  boolean closeWord = s.contains("skip") || s.contains("close") || s.contains("dismiss")
+                          || s.contains("пропуст") || s.contains("закры") || s.contains("закрыт");
+                  if (closeWord) {
+                      String p = " " + s.replace('_', ' ').replace('.', ' ').replace(':', ' ')
+                              .replace('-', ' ').replace('/', ' ') + " ";
+                      boolean adWord = p.contains("реклам") || p.contains(" ad ") || p.contains(" ads ")
+                              || p.contains("advert");
+                      return adWord ? 2 : 1;
+                  }
+                  if (s.equals("×") || s.equals("✕") || s.equals("✖") || s.equals("✗") || s.equals("x")) return 1;
+                  return 0;
+              }
+
+              private boolean isAdMarker(String s) {
+                  if (s.isEmpty()) return false;
+                  return s.startsWith("реклама") || s.equals("ad") || s.equals("ads")
+                          || s.equals("sponsored") || s.equals("advertisement") || s.startsWith("ad ·");
+              }
+
+              /** Кнопки, которые нажимать нельзя. */
+              private boolean isBlocked(String s) {
+                  if (s.isEmpty()) return false;
+                  String[] bad = {
+                      "скачать", "download", "install", "установ", "купить", "buy", "открыть", "open",
+                      "перейти", "подробнее", "learn more", "забрать", "играть", "play", "узнать",
+                      "бонус", "bonus", "получить", "регистрац", "sign up", "register", "shop"
+                  };
+                  for (String b : bad) if (s.contains(b)) return true;
+                  return false;
+              }
+
+              private boolean click(AccessibilityNodeInfo n, float density) {
+                  int limit = (int) (120 * density);
+                  AccessibilityNodeInfo t = n;
+                  for (int d = 0; t != null && d < 5; d++) {
+                      if (t.isClickable()) {
+                          Rect r = new Rect();
+                          t.getBoundsInScreen(r);
+                          // слишком большой кликабельный контейнер — это может быть сам баннер
+                          if (r.width() <= limit && r.height() <= limit) {
+                              return t.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                          }
+                          break;
+                      }
+                      t = t.getParent();
+                  }
+                  // иконка не помечена как кликабельная — нажимаем жестом в её центр
+                  Rect r = new Rect();
+                  n.getBoundsInScreen(r);
+                  Path p = new Path();
+                  p.moveTo(r.exactCenterX(), r.exactCenterY());
+                  GestureDescription g = new GestureDescription.Builder()
+                          .addStroke(new GestureDescription.StrokeDescription(p, 0, 50))
+                          .build();
+                  return dispatchGesture(g, null, null);
+              }
+
+              private String lower(CharSequence s) {
+                  return s == null ? "" : s.toString().toLowerCase(Locale.ROOT).trim();
+              }
+
+              @Override public void onInterrupt() {}
+          }
+          EOF_FILE
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdSkipHelper-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
